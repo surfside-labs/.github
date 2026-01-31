@@ -1,0 +1,358 @@
+name: Build and Deploy to K3s
+
+on:
+  workflow_call:
+    inputs:
+      app-name:
+        description: 'Application name'
+        required: true
+        type: string
+      namespace:
+        description: 'Kubernetes namespace'
+        required: false
+        type: string
+        default: 'default'
+      dry-run:
+        description: 'Dry run mode (no deployment)'
+        required: false
+        type: boolean
+        default: false
+      config-file:
+        description: 'Path to K8s config file'
+        required: false
+        type: string
+        default: '.k8s/config.yaml'
+
+jobs:
+  build-and-deploy:
+    runs-on: self-hosted
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+      
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/arm64
+          push: ${{ !inputs.dry-run }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+      
+      - name: Generate Kubernetes manifests
+        if: ${{ !inputs.dry-run }}
+        run: |
+          cat > generate_manifests.py << 'EOF'
+          #!/usr/bin/env python3
+          import yaml
+          import sys
+          import os
+          from pathlib import Path
+          
+          def generate_manifests(config_file, app_name, namespace, image_tag):
+              """Generate Kubernetes manifests from config"""
+              
+              with open(config_file, 'r') as f:
+                  config = yaml.safe_load(f)
+              
+              app = config.get('app', {})
+              container = config.get('container', {})
+              service = config.get('service', {})
+              storage = config.get('storage', [])
+              deployment_cfg = config.get('deployment', {})
+              secrets = config.get('secrets', [])
+              
+              # Use provided values or fallback to config
+              app_name = app_name or app.get('name', 'app')
+              namespace = namespace or app.get('namespace', 'default')
+              replicas = app.get('replicas', 1)
+              
+              manifests = []
+              
+              # Namespace
+              manifests.append({
+                  'apiVersion': 'v1',
+                  'kind': 'Namespace',
+                  'metadata': {'name': namespace}
+              })
+              
+              # PersistentVolumeClaims
+              for vol in storage:
+                  if vol.get('enabled', True):
+                      manifests.append({
+                          'apiVersion': 'v1',
+                          'kind': 'PersistentVolumeClaim',
+                          'metadata': {
+                              'name': f"{app_name}-{vol['name']}",
+                              'namespace': namespace
+                          },
+                          'spec': {
+                              'accessModes': ['ReadWriteOnce'],
+                              'resources': {
+                                  'requests': {'storage': vol['size']}
+                              },
+                              'storageClassName': vol.get('storageClass', 'local-path')
+                          }
+                      })
+              
+              # Deployment
+              pod_spec = {
+                  'containers': [{
+                      'name': app_name,
+                      'image': image_tag,
+                      'imagePullPolicy': 'Always',
+                      'ports': [{'containerPort': container.get('port', 8080), 'name': 'http'}]
+                  }]
+              }
+              
+              # Add additional ports
+              if 'additionalPorts' in container:
+                  for idx, port in enumerate(container['additionalPorts']):
+                      pod_spec['containers'][0]['ports'].append({
+                          'containerPort': port,
+                          'name': f'port-{idx+1}'
+                      })
+              
+              # Environment variables
+              if container.get('env'):
+                  pod_spec['containers'][0]['env'] = [
+                      {'name': k, 'value': str(v)} 
+                      for k, v in container['env'].items()
+                  ]
+              
+              # Resources
+              if container.get('resources'):
+                  pod_spec['containers'][0]['resources'] = container['resources']
+              
+              # Health checks
+              health = container.get('healthCheck', {})
+              if health.get('enabled', True):
+                  health_path = health.get('path', '/health')
+                  health_port = health.get('port', container.get('port', 8080))
+                  probe = {
+                      'httpGet': {
+                          'path': health_path,
+                          'port': health_port
+                      },
+                      'initialDelaySeconds': health.get('initialDelaySeconds', 30),
+                      'periodSeconds': health.get('periodSeconds', 10),
+                      'timeoutSeconds': health.get('timeoutSeconds', 5),
+                      'failureThreshold': health.get('failureThreshold', 3)
+                  }
+                  pod_spec['containers'][0]['livenessProbe'] = probe.copy()
+                  pod_spec['containers'][0]['readinessProbe'] = probe.copy()
+              
+              # Volume mounts
+              if storage or secrets:
+                  pod_spec['containers'][0]['volumeMounts'] = []
+                  pod_spec['volumes'] = []
+              
+              # Storage volumes
+              for vol in storage:
+                  if vol.get('enabled', True):
+                      pod_spec['containers'][0]['volumeMounts'].append({
+                          'name': vol['name'],
+                          'mountPath': vol['mountPath']
+                      })
+                      pod_spec['volumes'].append({
+                          'name': vol['name'],
+                          'persistentVolumeClaim': {
+                              'claimName': f"{app_name}-{vol['name']}"
+                          }
+                      })
+              
+              # Secret volumes
+              for secret in secrets:
+                  secret_name = secret.get('name', f"{app_name}-secrets")
+                  mount_path = secret.get('mountPath', '/secrets')
+                  pod_spec['containers'][0]['volumeMounts'].append({
+                      'name': secret_name,
+                      'mountPath': mount_path,
+                      'readOnly': True
+                  })
+                  pod_spec['volumes'].append({
+                      'name': secret_name,
+                      'secret': {
+                          'secretName': secret_name,
+                          'optional': secret.get('optional', False)
+                      }
+                  })
+              
+              # Image pull secrets
+              pod_spec['imagePullSecrets'] = [{'name': 'regcred'}]
+              
+              deployment = {
+                  'apiVersion': 'apps/v1',
+                  'kind': 'Deployment',
+                  'metadata': {
+                      'name': app_name,
+                      'namespace': namespace,
+                      'labels': {'app': app_name}
+                  },
+                  'spec': {
+                      'replicas': replicas,
+                      'strategy': {
+                          'type': deployment_cfg.get('strategy', 'RollingUpdate')
+                      },
+                      'selector': {
+                          'matchLabels': {'app': app_name}
+                      },
+                      'template': {
+                          'metadata': {
+                              'labels': {'app': app_name}
+                          },
+                          'spec': pod_spec
+                      }
+                  }
+              }
+              manifests.append(deployment)
+              
+              # Service
+              service_ports = []
+              if isinstance(service.get('ports'), list):
+                  # Multiple ports
+                  for port_cfg in service['ports']:
+                      service_ports.append({
+                          'name': port_cfg.get('name', 'http'),
+                          'port': port_cfg.get('port', 80),
+                          'targetPort': port_cfg.get('targetPort', container.get('port', 8080)),
+                          'protocol': port_cfg.get('protocol', 'TCP')
+                      })
+              else:
+                  # Single port (backwards compatible)
+                  service_ports.append({
+                      'name': 'http',
+                      'port': service.get('port', 80),
+                      'targetPort': service.get('targetPort', container.get('port', 8080)),
+                      'protocol': 'TCP'
+                  })
+              
+              service_manifest = {
+                  'apiVersion': 'v1',
+                  'kind': 'Service',
+                  'metadata': {
+                      'name': app_name,
+                      'namespace': namespace,
+                      'labels': {'app': app_name}
+                  },
+                  'spec': {
+                      'type': service.get('type', 'ClusterIP'),
+                      'selector': {'app': app_name},
+                      'ports': service_ports
+                  }
+              }
+              manifests.append(service_manifest)
+              
+              return manifests
+          
+          if __name__ == '__main__':
+              config_file = sys.argv[1]
+              app_name = sys.argv[2]
+              namespace = sys.argv[3]
+              image_tag = sys.argv[4]
+              
+              manifests = generate_manifests(config_file, app_name, namespace, image_tag)
+              
+              # Output all manifests
+              output = yaml.dump_all(manifests, explicit_start=True, default_flow_style=False)
+              print(output)
+          EOF
+          
+          chmod +x generate_manifests.py
+          
+          # Generate manifests
+          IMAGE_TAG="ghcr.io/${{ github.repository }}:${{ github.sha }}"
+          python3 generate_manifests.py "${{ inputs.config-file }}" "${{ inputs.app-name }}" "${{ inputs.namespace }}" "$IMAGE_TAG" > manifests.yaml
+          
+          echo "Generated manifests:"
+          cat manifests.yaml
+      
+      - name: Setup kubectl
+        if: ${{ !inputs.dry-run }}
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+          kubectl version --client
+      
+      - name: Create image pull secret
+        if: ${{ !inputs.dry-run }}
+        env:
+          KUBECONFIG: /home/github-runner/.kube/config
+        run: |
+          # Create namespace
+          cat <<EOF | kubectl apply -f - --validate=false
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: ${{ inputs.namespace }}
+          EOF
+          
+          # Create image pull secret
+          kubectl create secret docker-registry regcred \
+            --docker-server=ghcr.io \
+            --docker-username=${{ github.actor }} \
+            --docker-password=${{ secrets.GITHUB_TOKEN }} \
+            --namespace=${{ inputs.namespace }} \
+            --save-config \
+            --dry-run=client -o yaml | kubectl apply -f - --validate=false
+      
+      - name: Deploy to K3s
+        if: ${{ !inputs.dry-run }}
+        env:
+          KUBECONFIG: /home/github-runner/.kube/config
+        run: |
+          kubectl apply -f manifests.yaml
+          kubectl rollout status deployment/${{ inputs.app-name }} -n ${{ inputs.namespace }} --timeout=5m
+      
+      - name: Get service info
+        if: ${{ !inputs.dry-run }}
+        env:
+          KUBECONFIG: /home/github-runner/.kube/config
+        run: |
+          echo "=== Deployment Status ==="
+          kubectl get pods -n ${{ inputs.namespace }} -l app=${{ inputs.app-name }}
+          echo ""
+          echo "=== Service Info ==="
+          kubectl get svc -n ${{ inputs.namespace }} ${{ inputs.app-name }}
+          echo ""
+          echo "=== Events ==="
+          kubectl get events -n ${{ inputs.namespace }} --sort-by='.lastTimestamp' | tail -10
+      
+      - name: Dry run summary
+        if: ${{ inputs.dry-run }}
+        run: |
+          echo "🔍 DRY RUN MODE - No deployment performed"
+          echo "✅ Docker image built successfully"
+          echo "📦 Image would be: ghcr.io/${{ github.repository }}:${{ github.sha }}"
+          echo "🎯 Target namespace: ${{ inputs.namespace }}"
+          echo "🚀 Target app: ${{ inputs.app-name }}"
+          echo ""
+          echo "Merge this PR to deploy automatically!"
