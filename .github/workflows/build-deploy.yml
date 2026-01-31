@@ -66,11 +66,6 @@ jobs:
           cache-to: type=gha,mode=max
           provenance: false
       
-      - name: Install Python dependencies
-        if: ${{ !inputs.dry-run }}
-        run: |
-          python3 -m pip install --user pyyaml jinja2
-      
       - name: Generate Kubernetes manifests
         if: ${{ !inputs.dry-run }}
         run: |
