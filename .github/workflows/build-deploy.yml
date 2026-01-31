@@ -300,13 +300,7 @@ jobs:
           mkdir -p ~/.kube
           echo "${{ secrets.KUBECONFIG }}" | base64 -d > ~/.kube/config
           chmod 600 ~/.kube/config
-          export KUBECONFIG=~/.kube/config
           kubectl version --client
-          # Debug: Show what we're actually using
-          echo "=== DEBUG INFO ==="
-          echo "KUBECONFIG file location: $(ls -la ~/.kube/config | tail -1)"
-          echo "Contents:"
-          head -5 ~/.kube/config
       
       - name: Create image pull secret
         if: ${{ !inputs.dry-run }}
