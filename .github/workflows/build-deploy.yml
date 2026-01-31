@@ -308,12 +308,21 @@ jobs:
         env:
           KUBECONFIG: /home/github-runner/.kube/config
         run: |
-          kubectl create namespace ${{ inputs.namespace }} --dry-run=client -o yaml | kubectl apply -f - --validate=false
+          # Create namespace
+          cat <<EOF | kubectl apply -f - --validate=false
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: ${{ inputs.namespace }}
+          EOF
+          
+          # Create image pull secret
           kubectl create secret docker-registry regcred \
             --docker-server=ghcr.io \
             --docker-username=${{ github.actor }} \
             --docker-password=${{ secrets.GITHUB_TOKEN }} \
             --namespace=${{ inputs.namespace }} \
+            --save-config \
             --dry-run=client -o yaml | kubectl apply -f - --validate=false
       
       - name: Deploy to K3s
